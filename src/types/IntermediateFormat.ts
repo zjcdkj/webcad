@@ -1,5 +1,18 @@
 import { BoundingBox, GeometryType, Point } from './converter';
-import { Layer, Attribute, Block, LineType, TextStyle } from './geometry';
+import { Layer, LineType, TextStyle, Block, Attribute } from './geometry';
+
+export interface Geometry {
+  id: string;
+  type: GeometryType;
+  data: {
+    points?: Point[];
+    center?: Point;
+    radius?: number;
+    rotation?: number;
+  };
+  layerId: string;
+  styleId: string;
+}
 
 export interface IntermediateFormat {
   version: string;
@@ -18,18 +31,4 @@ export interface IntermediateFormat {
     lineTypes: LineType[];
     textStyles: TextStyle[];
   };
-}
-
-export interface Geometry {
-  id: string;
-  type: GeometryType;
-  data: {
-    points?: Point[];
-    center?: Point;
-    radius?: number;
-    rotation?: number;
-    // 其他几何数据
-  };
-  layerId: string;
-  styleId: string;
 } 

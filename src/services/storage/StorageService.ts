@@ -1,69 +1,90 @@
-import fs from 'fs/promises';
-import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
-import { UploadedFile } from '../../types/file';
-import { IntermediateFormat } from '../../types/IntermediateFormat';
+import { UploadedFile, FileMetadata } from '../../types/file';
+import { MinioService } from './MinioService';
+import { Logger } from '../logger/Logger';
+import { FileService } from '../file/FileService';
 
 export class StorageService {
-  private uploadDir: string;
+  private logger: Logger;
+  private minioService: MinioService;
+  private fileService: FileService;
 
-  constructor(uploadDir: string) {
-    this.uploadDir = uploadDir;
-    this.ensureUploadDir();
+  constructor() {
+    this.logger = new Logger('StorageService');
+    this.minioService = new MinioService();
+    this.fileService = new FileService();
   }
 
-  private async ensureUploadDir() {
+  async saveFile(file: Express.Multer.File): Promise<Express.Multer.File> {
     try {
-      await fs.access(this.uploadDir);
-    } catch {
-      await fs.mkdir(this.uploadDir, { recursive: true });
-    }
-  }
+      const id = uuidv4();
+      const fileExt = file.originalname.split('.').pop() || '';
+      const objectName = `${id}.${fileExt}`;
 
-  async saveFile(file: Express.Multer.File): Promise<UploadedFile> {
-    const id = uuidv4();
-    const fileExt = path.extname(file.originalname);
-    const filename = `${id}${fileExt}`;
-    const filePath = path.join(this.uploadDir, filename);
+      await this.minioService.uploadFile(
+        objectName,
+        file.buffer,
+        {
+          'Content-Type': file.mimetype,
+          'x-amz-meta-originalname': file.originalname,
+          'x-amz-meta-fileid': id
+        }
+      );
 
-    // 移动上传的临时文件到存储目录
-    await fs.rename(file.path, filePath);
-
-    return {
-      id,
-      filename,
-      originalname: file.originalname,
-      mimetype: file.mimetype,
-      size: file.size,
-      path: filePath,
-      createdAt: new Date(),
-      status: 'pending'
-    };
-  }
-
-  async deleteFile(fileId: string): Promise<void> {
-    const filePath = path.join(this.uploadDir, fileId);
-    try {
-      await fs.unlink(filePath);
+      return {
+        ...file,
+        filename: objectName,
+        path: objectName
+      };
     } catch (error) {
-      if (error.code !== 'ENOENT') {
-        throw error;
-      }
+      this.logger.error('Failed to save file:', error);
+      throw error;
     }
   }
 
-  async getFilePath(fileId: string): Promise<string> {
-    const filePath = path.join(this.uploadDir, fileId);
+  async getFile(filePath: string): Promise<Buffer> {
     try {
-      await fs.access(filePath);
-      return filePath;
-    } catch {
-      throw new Error('File not found');
+      this.logger.info(`Getting file from storage: ${filePath}`);
+      const buffer = await this.minioService.downloadFile(filePath);
+      if (!buffer) {
+        throw new Error(`File not found in storage: ${filePath}`);
+      }
+      return buffer;
+    } catch (error) {
+      this.logger.error(`Failed to get file from storage: ${filePath}`, error);
+      throw error;
     }
   }
 
-  async save(fileId: string, data: IntermediateFormat): Promise<void> {
-    const filePath = path.join(this.uploadDir, `${fileId}.json`);
-    await fs.writeFile(filePath, JSON.stringify(data));
+  async deleteFile(filePath: string): Promise<void> {
+    try {
+      await this.minioService.deleteFile(filePath);
+    } catch (error) {
+      this.logger.error('Failed to delete file:', error);
+      throw error;
+    }
+  }
+
+  async updateFileMetadata(fileId: string, metadata: Partial<FileMetadata>): Promise<void> {
+    try {
+      const file = await this.fileService.getFile(fileId);
+      if (!file) {
+        throw new Error('File not found');
+      }
+
+      // Base64 编码元数据
+      const encodedMetadata = Buffer.from(JSON.stringify(metadata)).toString('base64');
+
+      // 更新 MinIO 元数据
+      await this.minioService.updateMetadata(file.path, {
+        'x-amz-meta-metadata': encodedMetadata
+      });
+
+      // 更新数据库元数据
+      await this.fileService.updateFileMetadata(fileId, metadata);
+    } catch (error) {
+      this.logger.error('Failed to update file metadata:', error);
+      throw error;
+    }
   }
 } 

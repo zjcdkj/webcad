@@ -1,13 +1,4 @@
-export interface Point {
-  x: number;
-  y: number;
-  z: number;
-}
-
-export interface BoundingBox {
-  min: Point;
-  max: Point;
-}
+import { GeometryType, Point, BoundingBox } from './converter';
 
 export interface Layer {
   id: string;
@@ -20,11 +11,22 @@ export interface Layer {
   };
 }
 
-export interface Attribute {
+export interface Geometry {
   id: string;
-  tag: string;
-  value: string;
-  position?: Point;
+  type: GeometryType;
+  layerId: string;
+  styleId: string;
+  data: GeometryData;
+}
+
+export interface GeometryData {
+  points?: Point[];
+  center?: Point;
+  radius?: number;
+  startAngle?: number;
+  endAngle?: number;
+  closed?: boolean;
+  text?: string;
 }
 
 export interface Block {
@@ -48,4 +50,12 @@ export interface TextStyle {
   fontSize: number;
   bold?: boolean;
   italic?: boolean;
+}
+
+export interface Attribute {
+  id: string;
+  tag: string;
+  value: string;
+  position: Point;
+  style?: TextStyle;
 } 

@@ -1,7 +1,11 @@
 import { IntermediateFormat } from './IntermediateFormat';
+import { Geometry, Layer, Block } from './geometry';
 
 export interface IConverter {
-  convert(filePath: string): Promise<IntermediateFormat>;
+  convert(buffer: Buffer): Promise<IntermediateFormat>;
+  getGeometries(buffer: Buffer): Promise<Geometry[]>;
+  getLayers(buffer: Buffer): Promise<Layer[]>;
+  getBlocks(buffer: Buffer): Promise<Block[]>;
 }
 
 export enum GeometryType {
@@ -12,7 +16,9 @@ export enum GeometryType {
   TEXT = 'TEXT',
   BLOCK = 'BLOCK',
   POINT = 'POINT',
-  SPLINE = 'SPLINE'
+  SPLINE = 'SPLINE',
+  DIMENSION = 'DIMENSION',
+  HATCH = 'HATCH'
 }
 
 export interface Point {

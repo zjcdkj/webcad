@@ -1,77 +1,212 @@
-import { Queue, Job } from 'bull';
-import { promises as fs } from 'fs';
+import Bull, { Job } from 'bull';
 import { IConverter } from '../../types/converter';
-import { ConversionStatus, ConversionJob } from '../../types/conversion';
-import { UploadedFile } from '../../types/file';
-import { DataOptimizer } from '../optimizer/DataOptimizer';
-import { StorageService } from '../storage/StorageService';
 import { Logger } from '../logger/Logger';
+import { FileService } from '../file/FileService';
+import { StorageService } from '../storage/StorageService';
+import { ConversionJob, ConversionStatus, ConversionOptions } from '../../types/conversion';
+import { ApiError } from '../../utils/ApiError';
+import { UploadedFile } from '../../types/file';
 
 export class ConversionService {
   private logger: Logger;
+  private readonly DEFAULT_MAX_ATTEMPTS = 3;
+  private readonly DEFAULT_TIMEOUT = 300000; // 5分钟
 
   constructor(
     private converter: IConverter,
-    private queue: Queue<ConversionJob>,
-    private optimizer: DataOptimizer,
-    private storage: StorageService
+    private queue: Bull,
+    private fileService: FileService,
+    private storageService: StorageService
   ) {
     this.logger = new Logger('ConversionService');
+    this.initializeQueue();
+    this.cleanOldJobs();
   }
 
-  async convertFile(file: UploadedFile): Promise<string> {
-    let job: Job<ConversionJob> | undefined;
-    
+  private async cleanOldJobs() {
     try {
-      // 1. 添加到转换队列
-      job = await this.queue.add({
-        fileId: file.id,
-        filePath: file.path,
-        status: 'pending'
-      });
-
-      // 2. 执行转换
-      await job.update({ status: 'converting' });
-      const intermediateFormat = await this.converter.convert(file.path);
-
-      // 3. 优化数据
-      await job.update({ status: 'optimizing' });
-      const optimized = await this.optimizer.optimize(intermediateFormat);
-
-      // 4. 存储转换结果
-      await job.update({ status: 'saving' });
-      await this.storage.save(file.id, optimized);
-
-      // 5. 清理临时文件
-      await this.cleanup(file.path);
-
-      await job.update({ status: 'completed' });
-      return job.id;
-
-    } catch (error) {
-      if (job) {
-        await job.update({ 
-          status: 'failed',
-          error: error instanceof Error ? error.message : 'Unknown error'
-        });
+      const jobs = await this.queue.getJobs(['active', 'waiting', 'delayed', 'failed']);
+      for (const job of jobs) {
+        await job.remove();
       }
-      throw error;
+      this.logger.info('Cleaned up old jobs');
+    } catch (error) {
+      this.logger.error('Failed to clean old jobs:', error);
     }
   }
 
-  async getConversionStatus(jobId: string): Promise<ConversionStatus> {
+  private initializeQueue() {
+    this.queue.process(async (job: Job) => {
+      const { fileId } = job.data;
+      
+      try {
+        await this.updateJobProgress(job, 0);
+        
+        // 1. 从 MinIO 获取原始文件
+        const file = await this.fileService.getFile(fileId);
+        if (!file) {
+          throw new Error(`File not found: ${fileId}`);
+        }
+
+        const fileBuffer = await this.storageService.getFile(file.path);
+        await this.updateJobProgress(job, 20);
+
+        // 2. 使用转换器转换文件
+        const convertedData = await this.converter.convert(fileBuffer);
+        await this.updateJobProgress(job, 60);
+
+        // 3. 保存转换结果
+        const outputPath = `converted/${file.id}/data.json`;
+        const convertedBuffer = Buffer.from(JSON.stringify(convertedData));
+        
+        const convertedFile: UploadedFile = {
+          id: `${file.id}_converted`,
+          filename: 'data.json',
+          originalname: 'data.json',
+          mimetype: 'application/json',
+          size: convertedBuffer.length,
+          path: outputPath,
+          status: 'completed',
+          createdAt: new Date(),
+          metadata: {
+            format: 'JSON',
+            lastModified: new Date(),
+            layers: convertedData.layers.map(layer => layer.name)
+          }
+        };
+
+        await this.storageService.saveFile({
+          originalname: convertedFile.originalname,
+          buffer: convertedBuffer,
+          mimetype: convertedFile.mimetype,
+          size: convertedFile.size,
+          filename: convertedFile.filename,
+          path: convertedFile.path,
+          fieldname: 'file'
+        } as Express.Multer.File);
+
+        await this.updateJobProgress(job, 80);
+
+        // 4. 更新文件状态
+        await this.fileService.updateFileStatus(fileId, 'completed');
+        await this.updateJobProgress(job, 100);
+
+        return {
+          status: 'completed' as ConversionStatus,
+          outputPath
+        };
+      } catch (error) {
+        this.logger.error(`Conversion failed for file ${fileId}:`, error);
+        await this.fileService.updateFileStatus(fileId, 'failed');
+        throw error;
+      }
+    });
+  }
+
+  private async updateJobProgress(job: Job, progress: number): Promise<void> {
+    try {
+      await job.progress(progress);
+      await job.update({
+        ...job.data,
+        progress,
+        updatedAt: new Date()
+      });
+    } catch (error) {
+      this.logger.error(`Failed to update job progress for job ${job.id}:`, error);
+    }
+  }
+
+  async startConversion(fileId: string, options: ConversionOptions = {}): Promise<string> {
+    const file = await this.fileService.getFile(fileId);
+    if (!file) {
+      throw new ApiError(404, 'File not found');
+    }
+
+    // 检查是否已有相同文件的转换任务
+    const existingJobs = await this.queue.getJobs(['active', 'waiting', 'delayed']);
+    const existingJob = existingJobs.find((job: Job) => job.data.fileId === fileId);
+    if (existingJob) {
+      return existingJob.id;
+    }
+
+    const job = await this.queue.add({
+      fileId,
+      status: 'pending',
+      progress: 0,
+      attempts: 0,
+      maxAttempts: options.maxAttempts || this.DEFAULT_MAX_ATTEMPTS,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    }, {
+      attempts: options.maxAttempts || this.DEFAULT_MAX_ATTEMPTS,
+      timeout: options.timeout || this.DEFAULT_TIMEOUT,
+      priority: options.priority,
+      removeOnComplete: false,
+      removeOnFail: false
+    });
+
+    return job.id;
+  }
+
+  async getConversionStatus(jobId: string): Promise<ConversionJob | null> {
+    const job = await this.queue.getJob(jobId);
+    if (!job) return null;
+
+    const state = await job.getState();
+    let progress = 0;
+
+    try {
+      // 修改这里：直接传递 0 作为参数
+      const progressData = await job.progress(0);
+      progress = typeof progressData === 'number' ? progressData : 0;
+    } catch (error) {
+      this.logger.error(`Failed to get progress for job ${jobId}:`, error);
+    }
+
+    return {
+      id: job.id,
+      ...job.data,
+      status: state as ConversionStatus,
+      progress
+    };
+  }
+
+  async retryConversion(jobId: string): Promise<void> {
     const job = await this.queue.getJob(jobId);
     if (!job) {
-      throw new Error('Job not found');
+      throw new ApiError(404, 'Conversion job not found');
     }
-    return job.data.status;
+
+    await job.retry();
   }
 
-  private async cleanup(filePath: string): Promise<void> {
-    try {
-      await fs.unlink(filePath);
-    } catch (error) {
-      this.logger.error(`Failed to cleanup file ${filePath}:`, error);
+  async getConvertedFile(jobId: string): Promise<Buffer> {
+    const job = await this.queue.getJob(jobId);
+    if (!job) {
+      throw new ApiError(404, 'Conversion job not found');
     }
+
+    const result = await job.finished();
+    if (!result || !result.outputPath) {
+      throw new ApiError(400, 'Conversion not completed');
+    }
+
+    return await this.storageService.getFile(result.outputPath);
   }
-} 
+
+  async deleteConversion(jobId: string): Promise<void> {
+    const job = await this.queue.getJob(jobId);
+    if (!job) {
+      throw new ApiError(404, 'Conversion job not found');
+    }
+
+    // 删除转换结果文件
+    const result = await job.finished();
+    if (result && result.outputPath) {
+      await this.storageService.deleteFile(result.outputPath);
+    }
+
+    // 删除作业
+    await job.remove();
+  }
+}
